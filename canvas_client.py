@@ -168,12 +168,23 @@ def todo_to_dict(t: Any) -> dict:
 # --- 데이터 조회 함수 ---------------------------------------------------------
 
 
-def list_courses(active_only: bool = True) -> list[dict]:
+def list_courses(active_only: bool = True, current_term_only: bool = False) -> list[dict]:
+    """수강 강의 목록. current_term_only=True 면 이번 학기 과목만 남긴다.
+
+    eTL 은 강의 start_at/end_at 을 안 채우지만 term_id 가 학기 순서대로 커지므로
+    (2025-2=138 < 2026-3(여름)=163 < 2026-2(가을)=164), 가장 큰 term_id 를 이번 학기로 본다.
+    """
     canvas = get_canvas()
     kwargs: dict[str, Any] = {"include": ["total_scores"]}
     if active_only:
         kwargs["enrollment_state"] = "active"
-    return [course_to_dict(c) for c in canvas.get_courses(**kwargs)]
+    courses = [course_to_dict(c) for c in canvas.get_courses(**kwargs)]
+    if current_term_only:
+        terms = [c["term_id"] for c in courses if c["term_id"]]
+        if terms:
+            latest = max(terms)
+            courses = [c for c in courses if c["term_id"] == latest]
+    return courses
 
 
 def list_assignments(course_id: int) -> list[dict]:
@@ -311,6 +322,60 @@ def _fetch_sugang_syllabus(params: dict) -> dict | None:
     }
 
 
+def _sugang_params(course_id: int) -> tuple[dict, str | None, Any]:
+    """eTL syllabus_body 에 박힌 sugang cc103 URL 에서 과목 파라미터를 뽑는다.
+
+    (params, url, course) 를 돌려준다 — 강의계획서·강의교재가 같은 파라미터를 쓴다.
+    """
+    course = get_canvas().get_course(course_id, include=["syllabus_body"])
+    body = _get(course, "syllabus_body") or ""
+    m = _SUGANG_SYLLABUS_RE.search(body)
+    url = m.group(0).replace("&amp;", "&").rstrip("&") if m else None
+    params = dict(re.findall(r"[?&]([^=&]+)=([^&]*)", url)) if url else {}
+    return params, url, course
+
+
+def get_textbooks(course_id: int) -> dict:
+    """'강의교재' 탭 — 교재/부교재 목록(ISBN·출판사·도서관 소장 링크)을 반환한다.
+
+    강의교재 탭은 LearningX LTI 지만 실제로는 sugang 의 cc103bk.action 을 iframe 으로
+    띄우는 것이라, 강의계획서와 같은 파라미터로 cc103bkajax.action 에서 JSON 을 받는다
+    (SNU 로그인 불필요, Referer 헤더만 필요).
+    """
+    import requests
+
+    params, _url, course = _sugang_params(course_id)
+    out = {"course_id": course_id, "course": _get(course, "name"), "textbooks": []}
+    if not params:
+        out["note"] = "강의계획서 링크가 없어 교재 정보를 찾지 못했습니다."
+        return out
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0",
+                          "Referer": "https://sugang.snu.ac.kr/",
+                          "X-Requested-With": "XMLHttpRequest"})
+        d = s.post(f"{_SUGANG}/cc103bkajax.action",
+                   data={**params, "lang_knd": "ko"}, timeout=20).json()
+    except Exception as e:
+        out["note"] = f"교재 조회 실패: {e}"
+        return out
+    out["textbooks"] = [
+        {
+            "kind": b.get("ltTeachmFgNm"),          # 주교재 / 부교재
+            "type": b.get("ltTeachmTypeFgNm"),      # 도서 / 논문 등
+            "title": b.get("ltTeachmNm"),
+            "author": b.get("ltTeachmAuthNm"),
+            "publisher": b.get("ltTeachmPubcoNm"),
+            "year": b.get("ltTeachmPublshYy"),
+            "isbn": b.get("ltTeachmIsbnNo"),
+            "in_library": b.get("librryPosessYn") == "Y",
+            "library_url": b.get("ltTeachmLibrryUrl"),
+        }
+        for b in (d.get("LISTTAB03_LIST_TEACHM_BOOK") or [])
+    ]
+    return out
+
+
 def get_syllabus(course_id: int, fetch_content: bool = True) -> dict:
     """공식 강의계획서(SNU 수강신청 시스템)를 조회한다.
 
@@ -319,14 +384,7 @@ def get_syllabus(course_id: int, fetch_content: bool = True) -> dict:
     계획·첨부파일 등)을 JSON 으로 받아 정리해 돌려준다. SNU SSO 로그인은 필요 없다.
     fetch_content=False 면 본문 없이 링크/메타만 빠르게 반환한다.
     """
-    course = get_canvas().get_course(course_id, include=["syllabus_body"])
-    body = _get(course, "syllabus_body") or ""
-    m = _SUGANG_SYLLABUS_RE.search(body)
-    url = m.group(0).replace("&amp;", "&").rstrip("&") if m else None
-
-    params: dict[str, str] = {}
-    if url:
-        params = dict(re.findall(r"[?&]([^=&]+)=([^&]*)", url))
+    params, url, course = _sugang_params(course_id)
 
     out = {
         "course_id": course_id,
@@ -349,6 +407,185 @@ def list_modules(course_id: int) -> list[dict]:
     """강의의 주차/모듈 구조와 각 모듈의 항목을 순서대로 반환한다."""
     course = get_canvas().get_course(course_id)
     return [module_to_dict(m) for m in course.get_modules()]
+
+
+# --- 사이트 화면 전체를 읽기 위한 보강 (페이지·제출·성적·수강생·퀴즈·쪽지) --------
+
+
+def _raw(path: str, **params) -> Any:
+    """canvasapi 가 다루기 번거로운 엔드포인트를 직접 GET 한다(리스트/딕트 그대로).
+
+    include[] 같은 반복 파라미터를 그대로 넘기기 위해 requests 를 쓴다.
+    """
+    import requests
+
+    base = (os.environ.get("ETL_BASE_URL") or "").rstrip("/")
+    token = os.environ.get("ETL_TOKEN")
+    r = requests.get(
+        f"{base}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params, timeout=40,
+    )
+    if not r.ok:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def list_pages(course_id: int, include_body: bool = True) -> list[dict]:
+    """'페이지' 탭의 위키 페이지 목록(원하면 본문 포함)을 반환한다.
+
+    강의 안내·평가 방법 등이 페이지로만 올라오는 과목이 있어 본문까지 봐야 내용이 온전하다.
+    """
+    course = get_canvas().get_course(course_id)
+    out = []
+    try:
+        pages = list(course.get_pages())
+    except Exception:
+        return out
+    for p in pages:
+        row = {
+            "url": _get(p, "url"),
+            "title": _get(p, "title"),
+            "updated_at": _get(p, "updated_at"),
+            "html_url": _get(p, "html_url"),
+        }
+        if include_body:
+            try:
+                full = course.get_page(p.url)
+                row["body_html"] = _get(full, "body")
+                row["body"] = _strip_html(_get(full, "body"))
+            except Exception:
+                row["body"] = None
+        out.append(row)
+    return out
+
+
+def get_page(course_id: int, page_url: str) -> dict:
+    """페이지 1건의 본문(평문 + 원본 HTML)을 반환한다. page_url 은 list_pages 의 url."""
+    page = get_canvas().get_course(course_id).get_page(page_url)
+    body = _get(page, "body")
+    return {
+        "url": _get(page, "url"),
+        "title": _get(page, "title"),
+        "updated_at": _get(page, "updated_at"),
+        "html_url": _get(page, "html_url"),
+        "body": _strip_html(body),
+        "body_html": body,
+    }
+
+
+def get_submissions(course_id: int, only_graded: bool = False) -> list[dict]:
+    """내 과제 제출 상태·점수·교수 코멘트를 반환한다('성적' 화면의 실제 내용).
+
+    Canvas 의 get_grades 는 총점만 주지만, 여기서는 과제별 점수·만점·제출 시각·
+    지각 여부·채점자 코멘트까지 본다. only_graded=True 면 채점된 것만.
+    """
+    rows = _raw(
+        f"/api/v1/courses/{course_id}/students/submissions",
+        **{"student_ids[]": "self",
+           "include[]": ["submission_comments", "assignment"],
+           "per_page": 100},
+    ) or []
+    out = []
+    for s in rows:
+        if only_graded and s.get("score") is None:
+            continue
+        a = s.get("assignment") or {}
+        out.append({
+            "assignment_id": s.get("assignment_id"),
+            "assignment": a.get("name"),
+            "due_at": a.get("due_at"),
+            "points_possible": a.get("points_possible"),
+            "score": s.get("score"),
+            "grade": s.get("grade"),
+            "submitted_at": s.get("submitted_at"),
+            "graded_at": s.get("graded_at"),
+            "late": s.get("late"),
+            "missing": s.get("missing"),
+            "state": s.get("workflow_state"),
+            "attempt": s.get("attempt"),
+            "comments": [
+                {"author": c.get("author_name"), "created_at": c.get("created_at"),
+                 "comment": c.get("comment")}
+                for c in (s.get("submission_comments") or [])
+            ],
+        })
+    return out
+
+
+def list_people(course_id: int, include_students: bool = False) -> list[dict]:
+    """'수강생' 탭 — 교수·조교(기본)와, 원하면 수강생까지 반환한다."""
+    types = ["teacher", "ta", "designer"] + (["student"] if include_students else [])
+    rows = _raw(f"/api/v1/courses/{course_id}/users",
+                **{"enrollment_type[]": types, "include[]": ["enrollments"],
+                   "per_page": 100}) or []
+    role_kr = {"TeacherEnrollment": "교수", "TaEnrollment": "조교",
+               "StudentEnrollment": "학생", "DesignerEnrollment": "설계자"}
+    return [
+        {"id": u.get("id"), "name": u.get("name"),
+         "roles": [role_kr.get(e.get("type"), e.get("type"))
+                   for e in (u.get("enrollments") or [])]}
+        for u in rows
+    ]
+
+
+def list_quizzes(course_id: int) -> list[dict]:
+    """'퀴즈' 탭의 퀴즈/시험 목록. 퀴즈 메뉴가 없는 과목이면 빈 목록."""
+    rows = _raw(f"/api/v1/courses/{course_id}/quizzes", per_page=100)
+    if not isinstance(rows, list):
+        return []
+    return [
+        {"id": q.get("id"), "title": q.get("title"), "type": q.get("quiz_type"),
+         "due_at": q.get("due_at"), "unlock_at": q.get("unlock_at"),
+         "lock_at": q.get("lock_at"), "points_possible": q.get("points_possible"),
+         "time_limit": q.get("time_limit"), "allowed_attempts": q.get("allowed_attempts"),
+         "html_url": q.get("html_url"), "description": _strip_html(q.get("description"))}
+        for q in rows
+    ]
+
+
+def get_course_home(course_id: int) -> dict:
+    """'홈' 탭이 무엇을 보여주는지(default_view)와 첫 화면 페이지 본문을 반환한다."""
+    c = _raw(f"/api/v1/courses/{course_id}") or {}
+    out = {"course_id": course_id, "name": c.get("name"),
+           "default_view": c.get("default_view"),  # modules|wiki|syllabus|assignments|feed
+           "public_description": c.get("public_description")}
+    fp = _raw(f"/api/v1/courses/{course_id}/front_page")
+    if isinstance(fp, dict) and fp.get("body") is not None:
+        out["front_page"] = {"title": fp.get("title"), "body": _strip_html(fp.get("body"))}
+    return out
+
+
+def list_conversations(limit: int = 25, include_messages: bool = False) -> list[dict]:
+    """받은 쪽지함(Canvas conversations) 목록을 반환한다.
+
+    include_messages=True 면 각 대화의 메시지 본문까지 가져온다(대화당 요청 1회).
+    """
+    rows = _raw("/api/v1/conversations", per_page=limit) or []
+    out = []
+    for c in rows[:limit]:
+        row = {
+            "id": c.get("id"),
+            "subject": c.get("subject"),
+            "last_message_at": c.get("last_message_at"),
+            "message_count": c.get("message_count"),
+            "state": c.get("workflow_state"),  # unread|read|archived
+            "context": c.get("context_name"),
+            "participants": [p.get("name") for p in (c.get("participants") or [])],
+            "preview": c.get("last_message"),
+        }
+        if include_messages:
+            d = _raw(f"/api/v1/conversations/{c.get('id')}") or {}
+            row["messages"] = [
+                {"author_id": m.get("author_id"), "created_at": m.get("created_at"),
+                 "body": m.get("body")}
+                for m in (d.get("messages") or [])
+            ]
+        out.append(row)
+    return out
 
 
 def get_upcoming() -> list[dict]:

@@ -22,13 +22,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 
+import lti
 from canvas_client import get_canvas
 from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
@@ -73,71 +73,14 @@ def _youtube_id(url_or_id: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-class _LaunchForm(HTMLParser):
-    """LTI sessionless_launch 가 돌려주는 자동제출 폼(action + hidden 필드)을 파싱."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.action: str | None = None
-        self.fields: dict[str, str] = {}
-
-    def handle_starttag(self, tag: str, attrs: list) -> None:
-        d = dict(attrs)
-        if tag == "form" and d.get("action"):
-            self.action = d["action"]
-        if tag == "input" and "name" in d:
-            self.fields[d["name"]] = d.get("value", "")
-
-
-def _lecture_tool_id(base: str, token: str, course_id: int) -> int | None:
-    """강의에서 lecture_attendance LTI 외부도구 id 를 찾는다(과목마다 다를 수 있음)."""
-    H = {"Authorization": f"Bearer {token}"}
-    # 1) 외부도구 목록에서 lecture_attendance 탐색(빠름)
-    try:
-        r = requests.get(
-            f"{base}/api/v1/courses/{course_id}/external_tools",
-            headers=H, params={"per_page": 100}, timeout=20,
-        )
-        for t in r.json():
-            if "lecture_attendance" in json.dumps(t, ensure_ascii=False).lower():
-                return t.get("id")
-    except Exception:
-        pass
-    # 2) 폴백: 모듈 항목 중 lecture_attendance ExternalTool 의 content_id
-    try:
-        course = get_canvas().get_course(course_id)
-        for m in course.get_modules():
-            for it in m.get_module_items():
-                if "lecture_attendance" in (getattr(it, "external_url", "") or ""):
-                    cid = getattr(it, "content_id", None)
-                    if cid:
-                        return cid
-    except Exception:
-        pass
-    return None
-
-
 def _launch(course_id: int) -> tuple[str, requests.Session, str]:
-    """lecture_attendance LTI 런치를 수행하고 (base, 세션, xn_api_token) 을 반환한다."""
-    base, token = _env()
-    tid = _lecture_tool_id(base, token, course_id)
-    if tid is None:
-        raise RuntimeError("이 강의에는 영상 강의(lecture_attendance) 외부도구가 없습니다.")
-    s = requests.Session()
-    H = {"Authorization": f"Bearer {token}"}
-    launch_url = s.get(
-        f"{base}/api/v1/courses/{course_id}/external_tools/sessionless_launch",
-        headers=H, params={"id": tid}, timeout=20,
-    ).json()["url"]
-    p = _LaunchForm()
-    p.feed(s.get(launch_url, headers=H, timeout=20).text)
-    if not p.action:
-        raise RuntimeError("lecture_attendance 런치 폼을 파싱하지 못했습니다.")
-    s.post(p.action, data=p.fields, allow_redirects=True, timeout=30)
-    xn = s.cookies.get("xn_api_token")
-    if not xn:
-        raise RuntimeError("LearningX 세션 토큰(xn_api_token)을 받지 못했습니다.")
-    return base, s, xn
+    """lecture_attendance LTI 런치를 수행하고 (base, 세션, xn_api_token) 을 반환한다.
+
+    도구 id 는 lti.py 가 강의 메뉴(tabs)에서 찾는다 — external_tools 목록은 학생
+    토큰에서 빈 배열이라 그걸로 찾으면 대부분의 과목에서 실패한다.
+    """
+    lx = lti.launch_kind(course_id, "attendance")
+    return lx.base, lx.session, lx.xn
 
 
 def _api(base: str, s: requests.Session, xn: str, path: str, params: dict | None = None) -> Any:

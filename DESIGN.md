@@ -135,3 +135,33 @@ Canvas 는 페이지·공지 본문에 삽입된 파일을 `hidden=true` 로 두
 파일 id 는 조회가 404 이므로 `error` 를 남기고 대상에서 제외한다.
 외부 링크는 `direct_file|google_drive|youtube|lcms|other` 로 분류해, 직접 파일
 링크만 옵션(`include_external_links`)으로 내려받는다.
+
+## 8. 사이트 화면 커버리지 (tabs 기준, 2026-09-02)
+
+`GET /api/v1/courses/{id}/tabs` 가 학생이 실제로 보는 메뉴의 정답지다. 이번 학기
+7과목 모두 **탭 100% 읽기 성공**(`snapshot.get_course_snapshot` 의 coverage).
+
+- **LTI 도구 id 는 tabs 에서 얻는다.** `external_tools` 목록은 학생 토큰에서 빈 배열이라
+  거기서 찾으면 대부분 실패한다(이 버그로 `list_lecture_videos` 가 조용히 0개를
+  반환하고 있었다 → `lti.py` 로 교체해 복구).
+  2026-2 기준 id: 강의교재=150, 주차학습=83, 게시판=85, 강의/출결=48, 열린게시판=3.
+- **게시판이 두 종류다.** `열린게시판`(OpenBoard, `/boards/{hex}/posts`)과
+  `게시판`(learningx_board, `/learningx_board/courses/{cid}/boards`). 한 과목에 둘 다
+  있을 수 있어 `boards.py` 가 양쪽을 같은 스키마로 합친다. 글 첨부에는 Canvas file id 가
+  들어 있어 파일 탭에 없는 자료도 받을 수 있다.
+- **강의교재는 SPA 가 아니라 iframe** 이다 — LTI 런치 응답이 sugang `cc103bk.action` 을
+  가리키고, 강의계획서와 같은 파라미터로 `cc103bkajax.action` 이 JSON(교재·ISBN·도서관
+  소장 링크)을 준다.
+- **주차학습은 Canvas 모듈의 거울 + 내 상태**다. 항목 구성은 Canvas 모듈과 같지만
+  `completed`·`attendance_status`(출석/지각/결석)가 함께 온다 — Canvas API 엔 없다.
+- **성적 화면**은 `students/submissions?student_ids[]=self&include[]=submission_comments`
+  로 과제별 점수·만점·지각 여부·채점자 코멘트까지 나온다(`get_grades` 는 총점만).
+- 이번 학기 판정은 `term_id` 최댓값으로 한다(eTL 은 start_at/end_at 을 안 채우지만
+  term_id 는 학기 순서대로 커진다: 2025-2=138 < 2026-3 여름=163 < 2026-2 가을=164).
+
+권한이 없는 것(확인됨): analytics/student_summaries, gradebook_history, rubrics(401).
+
+## 9. 다음 단계 — 쓰기(상호작용)
+
+`ETL_ENABLE_WRITE=1` 게이트로 분리해서 추가할 범위(사용자 확정):
+과제 제출, 게시판·토론 글/댓글 작성, 출결·영상 진도. (쪽지 발송은 범위 밖)

@@ -9,13 +9,15 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+import boards
 import canvas_client as cc
 import links
 import materials
-import openboard
 import schedule
+import snapshot as snap
 import store
 import video
+import weekly
 
 mcp = FastMCP("snu-etl")
 
@@ -67,31 +69,44 @@ def get_discussion(
 
 
 @mcp.tool()
-def list_openboard_posts(
-    course_id: int, page_size: int = 50, page_index: int = 1
-) -> dict:
-    """특정 강의(course_id)의 '열린게시판'(OpenBoard) 글 목록을 본문과 함께 반환한다.
+def list_boards(course_id: int) -> list[dict]:
+    """특정 강의(course_id)의 게시판 목록을 반환한다('게시판'·'열린게시판' 양쪽).
 
-    eTL '열린게시판'은 Canvas 토론이 아니라 LearningX LTI 외부도구라, 일반 공지/토론
-    도구로는 안 잡힌다. 이 도구가 LTI 런치를 거쳐 실제 글을 가져온다(SNU 로그인 불필요).
-    각 글의 댓글(예: 보완 신청 명단)은 get_openboard_post 로 본다.
+    eTL 게시판은 Canvas 토론이 아니라 LearningX LTI 이고 계정에 두 종류가 있다
+    (Q&A·학습 피드백·과제 제출용 게시판 등). 각 항목의 board_id 를 list_board_posts 에 넘긴다.
     """
-    return openboard.list_openboard_posts(
-        course_id, page_size=page_size, page_index=page_index
+    return boards.list_boards(course_id)
+
+
+@mcp.tool()
+def list_board_posts(
+    course_id: int,
+    board_id: str | None = None,
+    page_size: int = 50,
+    page_index: int = 1,
+) -> list[dict]:
+    """게시판 글 목록을 반환한다. board_id 생략 시 그 강의의 모든 게시판을 훑는다.
+
+    '열린게시판'(OpenBoard)과 '게시판'(learningx_board)을 같은 형식으로 돌려준다.
+    본문 전체·첨부파일·댓글은 get_board_post 로 본다(목록의 content 는 비어 있을 수 있다).
+    """
+    return boards.list_board_posts(
+        course_id, board_id=board_id, page_size=page_size, page_index=page_index
     )
 
 
 @mcp.tool()
-def get_openboard_post(
-    course_id: int, post_id: str, include_comments: bool = True
+def get_board_post(
+    course_id: int, post_id: str, board_id: str | None = None,
+    include_comments: bool = True,
 ) -> dict:
-    """'열린게시판'(OpenBoard) 글 1건(post_id)의 본문과 댓글을 반환한다.
+    """게시판 글 1건의 본문·첨부파일·댓글을 반환한다(보완 신청 명단·과제 제출글 등).
 
-    post_id 는 list_openboard_posts 가 돌려준 각 글의 id 다.
-    댓글에는 작성자·학과가 담겨 보완 신청 명단 등을 그대로 확인할 수 있다.
+    post_id 는 list_board_posts 가 돌려준 각 글의 id. board_id 를 생략하면 강의의
+    게시판들을 차례로 뒤진다. 첨부파일에는 Canvas file id 가 들어 있어 다운로드도 된다.
     """
-    return openboard.get_openboard_post(
-        course_id, post_id, include_comments=include_comments
+    return boards.get_board_post(
+        course_id, post_id, board_id=board_id, include_comments=include_comments
     )
 
 
@@ -126,6 +141,68 @@ def list_linked_files(course_id: int, force: bool = False) -> dict:
 
 
 @mcp.tool()
+def get_course_snapshot(course_id: int, sections: list[str] | None = None) -> dict:
+    """강의 화면 전체를 한 번에 읽는다 — 실제 사이트에 접속했을 때 보이는 내용 전부.
+
+    강의 메뉴(tabs)를 기준으로 홈·공지·강의계획서·강의교재·수강생·모듈·주차학습·게시판·
+    과제·성적(내 점수/코멘트)·출결·파일(본문 링크 자료 포함)·페이지를 모두 훑어 담고,
+    탭별로 읽기 성공 여부(ok/empty/error)와 건수를 coverage 로 함께 준다.
+    sections 로 일부만 고를 수 있다(예 ['grades','attendance','pages']).
+    과목당 10~30초 걸리므로, 반복 조회는 sync_snapshot + get_stored_snapshot 를 쓴다.
+    """
+    return snap.get_course_snapshot(course_id, sections=sections)
+
+
+@mcp.tool()
+def get_submissions(course_id: int, only_graded: bool = False) -> list[dict]:
+    """내 과제 제출 상태·점수·교수 코멘트를 반환한다('성적' 화면의 실제 내용).
+
+    get_grades 가 총점만 주는 것과 달리 과제별 점수·만점·제출 시각·지각 여부와
+    채점자 코멘트("2. no second order derivative (-10)" 같은 감점 사유)까지 준다.
+    """
+    return cc.get_submissions(course_id, only_graded=only_graded)
+
+
+@mcp.tool()
+def get_attendance(course_id: int) -> dict:
+    """영상강의 출결 상태(출석/지각/결석)와 요약을 반환한다.
+
+    eTL '강의/출결' 화면의 내용으로, Canvas API 로는 안 보이고 LearningX 에만 있다.
+    """
+    return weekly.get_attendance(course_id)
+
+
+@mcp.tool()
+def list_weekly_items(course_id: int) -> list[dict]:
+    """'주차학습' 탭의 주차별 항목 전체(파일·영상·과제·퀴즈·링크)를 순서대로 반환한다.
+
+    각 항목에 내 완료 여부(completed)·출결 상태·마감이 함께 온다 — 사이트 화면과 동일하다.
+    """
+    return weekly.list_weekly_items(course_id)
+
+
+@mcp.tool()
+def get_textbooks(course_id: int) -> dict:
+    """'강의교재' 탭 — 주교재·부교재 목록(ISBN·출판사·도서관 소장 링크)을 반환한다."""
+    return cc.get_textbooks(course_id)
+
+
+@mcp.tool()
+def get_page(course_id: int, page_url: str) -> dict:
+    """강의 '페이지' 1건의 본문을 반환한다. page_url 은 페이지 주소의 마지막 조각.
+
+    페이지 목록은 get_course_snapshot(course_id, sections=['pages']) 로 본다.
+    """
+    return cc.get_page(course_id, page_url)
+
+
+@mcp.tool()
+def list_conversations(limit: int = 25, include_messages: bool = False) -> list[dict]:
+    """받은 쪽지함(Canvas 대화) 목록을 반환한다. include_messages=True 면 본문까지."""
+    return cc.list_conversations(limit=limit, include_messages=include_messages)
+
+
+@mcp.tool()
 def list_modules(course_id: int) -> list[dict]:
     """특정 강의(course_id)의 주차/모듈 구조와 각 모듈 항목을 순서대로 반환한다.
 
@@ -156,9 +233,14 @@ def whoami() -> dict:
 
 
 @mcp.tool()
-def sync_all(active_only: bool = True) -> dict:
-    """강의·공지·과제를 한 번에 eTL에서 조회해 로컬 저장소에 누적 반영한다."""
-    return store.sync_all(active_only=active_only)
+def sync_all(active_only: bool = True, snapshot: bool = True) -> dict:
+    """eTL 내용을 한 번에 조회해 로컬 저장소에 누적 반영한다(강의·공지·과제 + 화면 전체).
+
+    snapshot=True(기본)면 이번 학기 과목의 모든 탭(성적·출결·게시판·페이지·주차학습·
+    파일 등)까지 읽어 사이트와 같은 상태로 맞춘다 — 과목당 10~30초 걸린다.
+    공지·과제만 빠르게 갱신하려면 snapshot=False.
+    """
+    return store.sync_all(active_only=active_only, snapshot=snapshot)
 
 
 @mcp.tool()
@@ -195,6 +277,37 @@ def sync_assignments(course_id: int | None = None, active_only: bool = True) -> 
 
 
 @mcp.tool()
+def sync_snapshot(
+    course_id: int | None = None,
+    active_only: bool = True,
+    sections: list[str] | None = None,
+    current_term_only: bool = True,
+) -> dict:
+    """강의 화면 전체를 읽어 저장소에 반영하고, 지난번과 달라진 것을 이력에 남긴다.
+
+    "업데이트하면 실제 사이트와 같은 내용"을 담당하는 도구다. 탭 단위 섹션(공지·과제·
+    성적·출결·게시판·파일·페이지…)을 통째로 저장하고, 항목이 추가·수정·삭제되면
+    change_history 에 무엇이 바뀌었는지(제목까지) 기록한다.
+    course_id 생략 시 이번 학기 강의 전체(과목당 10~30초). 지난 학기까지 포함하려면
+    current_term_only=False.
+    """
+    return store.sync_snapshot(
+        course_id=course_id, active_only=active_only, sections=sections,
+        current_term_only=current_term_only,
+    )
+
+
+@mcp.tool()
+def get_stored_snapshot(course_id: int, section: str | None = None) -> dict:
+    """저장된 강의 화면 스냅샷을 반환한다(API 호출 없이 캐시 조회).
+
+    section 생략 시 모든 섹션. 각 섹션에 마지막 동기화·변경 시각이 함께 온다.
+    먼저 sync_snapshot 으로 채워두어야 한다.
+    """
+    return store.get_stored_snapshot(course_id, section=section)
+
+
+@mcp.tool()
 def get_stored_courses() -> list[dict]:
     """로컬 저장소의 강의 목록을 반환한다 (API 호출 없이 캐시 조회)."""
     return store.get_stored_courses()
@@ -226,8 +339,9 @@ def get_change_history(
 ) -> list[dict]:
     """변경 이력을 시간순으로 반환한다.
 
-    entity_type: 'course' | 'announcement' | 'discussion' | 'assignment' (생략 시 전체).
-    마감일 변경·공지 수정·게시판 새 글/답글 등이 누적 기록된다.
+    entity_type: 'course' | 'announcement' | 'discussion' | 'assignment' | 'section'
+    (생략 시 전체). 마감일 변경·공지 수정·게시판 새 글/답글이 기록되며, 'section' 은
+    sync_snapshot 이 남기는 화면 단위 변경(예: '성적' 섹션에 추가 2건)이다.
     """
     return store.get_change_history(
         entity_type=entity_type, course_id=course_id, entity_id=entity_id
