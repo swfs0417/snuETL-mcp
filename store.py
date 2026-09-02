@@ -12,6 +12,7 @@ import html
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -64,13 +65,26 @@ def _html_to_text(h: Optional[str]) -> str:
 
 def _conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # 자동 동기화(cron)·MCP 서버·수동 실행이 겹칠 수 있어, 잠깐의 잠금은 기다렸다 진행한다
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
+@contextmanager
+def _db():
+    """트랜잭션 1개를 열고 끝나면 반드시 닫는다(연결이 남아 잠금을 붙드는 것 방지)."""
+    conn = _conn()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    with _conn() as c:
+    with _db() as c:
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS courses (
@@ -174,12 +188,35 @@ def _summary(counts: dict, **extra) -> dict:
 # --- 동기화 (Sync) ------------------------------------------------------------
 
 
+def _sync_per_course(
+    table: str, etype: str, name_field: str,
+    fetch_rows, course_id: Optional[int], active_only: bool,
+) -> dict:
+    """과목마다 (조회 → 짧은 트랜잭션 쓰기)를 반복한다.
+
+    네트워크 대기 동안 DB 트랜잭션을 붙잡으면 동시에 도는 cron·MCP 서버가
+    'database is locked' 로 실패한다. 그래서 조회를 먼저 끝내고 쓸 때만 연결을 연다.
+    """
+    init_db()
+    ts = _now()
+    counts = {"new": 0, "changed": 0, "unchanged": 0}
+    targets = _targets(course_id, active_only)
+    for cid, cname in targets:
+        rows = fetch_rows(cid, cname)
+        if not rows:
+            continue
+        with _db() as conn:
+            for values in rows:
+                counts[_upsert(conn, table, etype, values, name_field, ts)] += 1
+    return _summary(counts, courses=len(targets))
+
+
 def sync_courses(active_only: bool = True) -> dict:
     """수강 강의 목록을 저장소에 누적 반영한다."""
     init_db()
     ts = _now()
     counts = {"new": 0, "changed": 0, "unchanged": 0}
-    with _conn() as conn:
+    with _db() as conn:
         for c in cc.list_courses(active_only=active_only):
             values = {
                 "id": c["id"], "name": c["name"], "course_code": c["course_code"],
@@ -191,23 +228,21 @@ def sync_courses(active_only: bool = True) -> dict:
 
 def sync_announcements(course_id: Optional[int] = None, active_only: bool = True) -> dict:
     """공지를 저장소에 누적 반영한다(본문은 텍스트로 정리해 저장, 수정 시 이력 기록)."""
-    init_db()
-    ts = _now()
-    counts = {"new": 0, "changed": 0, "unchanged": 0}
-    targets = _targets(course_id, active_only)
-    with _conn() as conn:
-        for cid, cname in targets:
-            course = cc.get_canvas().get_course(cid)
-            for d in course.get_discussion_topics(only_announcements=True):
-                a = cc.announcement_to_dict(d)
-                values = {
-                    "id": a["id"], "course_id": cid, "course_name": cname,
-                    "title": a["title"], "posted_at": a["posted_at"],
-                    "author": a["author"], "message": _html_to_text(a["message"]),
-                    "url": a["html_url"],
-                }
-                counts[_upsert(conn, "announcements", "announcement", values, "title", ts)] += 1
-    return _summary(counts, courses=len(targets))
+    def rows(cid, cname):
+        course = cc.get_canvas().get_course(cid)
+        out = []
+        for d in course.get_discussion_topics(only_announcements=True):
+            a = cc.announcement_to_dict(d)
+            out.append({
+                "id": a["id"], "course_id": cid, "course_name": cname,
+                "title": a["title"], "posted_at": a["posted_at"],
+                "author": a["author"], "message": _html_to_text(a["message"]),
+                "url": a["html_url"],
+            })
+        return out
+
+    return _sync_per_course("announcements", "announcement", "title", rows,
+                            course_id, active_only)
 
 
 def sync_discussions(course_id: Optional[int] = None, active_only: bool = True) -> dict:
@@ -216,46 +251,42 @@ def sync_discussions(course_id: Optional[int] = None, active_only: bool = True) 
     본문은 텍스트로 정리해 저장하고, 본문 수정·새 답글(reply_count 증가) 시 이력을 남긴다.
     eTL 은 only_announcements 를 명시할 때만 토픽을 돌려주므로 False 를 명시한다.
     """
-    init_db()
-    ts = _now()
-    counts = {"new": 0, "changed": 0, "unchanged": 0}
-    targets = _targets(course_id, active_only)
-    with _conn() as conn:
-        for cid, cname in targets:
-            course = cc.get_canvas().get_course(cid)
-            for d in course.get_discussion_topics(only_announcements=False):
-                t = cc.discussion_to_dict(d)
-                values = {
-                    "id": t["id"], "course_id": cid, "course_name": cname,
-                    "title": t["title"], "posted_at": t["posted_at"],
-                    "last_reply_at": t["last_reply_at"], "author": t["author"],
-                    "message": _html_to_text(t["message"]),
-                    "reply_count": t["reply_count"], "url": t["html_url"],
-                }
-                counts[_upsert(conn, "discussions", "discussion", values, "title", ts)] += 1
-    return _summary(counts, courses=len(targets))
+    def rows(cid, cname):
+        course = cc.get_canvas().get_course(cid)
+        out = []
+        for d in course.get_discussion_topics(only_announcements=False):
+            t = cc.discussion_to_dict(d)
+            out.append({
+                "id": t["id"], "course_id": cid, "course_name": cname,
+                "title": t["title"], "posted_at": t["posted_at"],
+                "last_reply_at": t["last_reply_at"], "author": t["author"],
+                "message": _html_to_text(t["message"]),
+                "reply_count": t["reply_count"], "url": t["html_url"],
+            })
+        return out
+
+    return _sync_per_course("discussions", "discussion", "title", rows,
+                            course_id, active_only)
 
 
 def sync_assignments(course_id: Optional[int] = None, active_only: bool = True) -> dict:
     """과제를 저장소에 누적 반영한다(마감일 변경 시 이력 기록)."""
-    init_db()
-    ts = _now()
-    counts = {"new": 0, "changed": 0, "unchanged": 0}
-    targets = _targets(course_id, active_only)
-    with _conn() as conn:
-        for cid, cname in targets:
-            course = cc.get_canvas().get_course(cid)
-            for ass in course.get_assignments():
-                a = cc.assignment_to_dict(ass)
-                values = {
-                    "id": a["id"], "course_id": cid, "course_name": cname,
-                    "name": a["name"], "due_at": a["due_at"], "lock_at": a["lock_at"],
-                    "unlock_at": a["unlock_at"], "points_possible": a["points_possible"],
-                    "submission_types": json.dumps(a["submission_types"], ensure_ascii=False),
-                    "html_url": a["html_url"],
-                }
-                counts[_upsert(conn, "assignments", "assignment", values, "name", ts)] += 1
-    return _summary(counts, courses=len(targets))
+    def rows(cid, cname):
+        course = cc.get_canvas().get_course(cid)
+        out = []
+        for ass in course.get_assignments():
+            a = cc.assignment_to_dict(ass)
+            out.append({
+                "id": a["id"], "course_id": cid, "course_name": cname,
+                "name": a["name"], "due_at": a["due_at"], "lock_at": a["lock_at"],
+                "unlock_at": a["unlock_at"], "points_possible": a["points_possible"],
+                "submission_types": json.dumps(a["submission_types"], ensure_ascii=False),
+                "html_url": a["html_url"],
+            })
+        return out
+
+    return _sync_per_course("assignments", "assignment", "name", rows,
+                            course_id, active_only)
 
 
 def sync_all(active_only: bool = True, snapshot: bool = True) -> dict:
@@ -286,7 +317,7 @@ def _query(table: str, course_id: Optional[int], order: str) -> list[dict]:
         q += " WHERE course_id = ?"
         params = (course_id,)
     q += f" ORDER BY {order}"
-    with _conn() as c:
+    with _db() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
@@ -354,14 +385,16 @@ def sync_snapshot(
     counts = {"new": 0, "changed": 0, "unchanged": 0}
     per_course = []
 
-    with _conn() as conn:
-        for cid, cname in targets:
-            try:
-                snapshot_data = snap.get_course_snapshot(cid, sections=sections)
-            except Exception as e:
-                per_course.append({"course": cname, "error": str(e)})
-                continue
-            changed_sections = []
+    for cid, cname in targets:
+        # 스냅샷 조회(과목당 10~30초)는 트랜잭션 밖에서 — 그 동안 DB 를 잠그면 안 된다
+        try:
+            snapshot_data = snap.get_course_snapshot(cid, sections=sections)
+        except Exception as e:
+            per_course.append({"course": cname, "error": str(e)})
+            continue
+
+        changed_sections = []
+        with _db() as conn:
             for section, raw in (snapshot_data.get("sections") or {}).items():
                 data = _stable(raw)
                 blob = json.dumps(data, ensure_ascii=False, sort_keys=True)
@@ -371,6 +404,7 @@ def sync_snapshot(
                     "SELECT hash, data, count FROM snapshots WHERE course_id=? AND section=?",
                     (cid, section),
                 ).fetchone()
+
                 if row is None:
                     conn.execute(
                         """INSERT INTO snapshots
@@ -383,12 +417,14 @@ def sync_snapshot(
                          "created", None, f"{cnt}건", ts)
                     counts["new"] += 1
                     continue
+
                 if row["hash"] == h:
                     conn.execute(
                         "UPDATE snapshots SET last_synced=? WHERE course_id=? AND section=?",
                         (ts, cid, section))
                     counts["unchanged"] += 1
                     continue
+
                 # 무엇이 달라졌는지 항목 단위로 요약
                 try:
                     old_data = json.loads(row["data"])
@@ -412,18 +448,19 @@ def sync_snapshot(
                     (cname, h, cnt, blob, ts, ts, cid, section),
                 )
                 _log(conn, "section", cid, cid, f"{cname} / {section}", detail,
-                     f"{row['count']}건", f"{cnt}건 — " + "; ".join(titles) if titles else f"{cnt}건",
-                     ts)
+                     f"{row['count']}건",
+                     f"{cnt}건 — " + "; ".join(titles) if titles else f"{cnt}건", ts)
                 counts["changed"] += 1
                 changed_sections.append({"section": section, "detail": detail,
                                          "items": titles})
-            per_course.append({
-                "course": cname,
-                "read": snapshot_data["coverage"]["read"],
-                "tabs": snapshot_data["coverage"]["tabs_total"],
-                "not_read": snapshot_data["coverage"]["not_read"],
-                "changed": changed_sections,
-            })
+
+        per_course.append({
+            "course": cname,
+            "read": snapshot_data["coverage"]["read"],
+            "tabs": snapshot_data["coverage"]["tabs_total"],
+            "not_read": snapshot_data["coverage"]["not_read"],
+            "changed": changed_sections,
+        })
     return _summary(counts, courses=len(targets), detail=per_course)
 
 
@@ -438,7 +475,7 @@ def get_stored_snapshot(course_id: int, section: Optional[str] = None) -> dict:
     if section:
         q += " AND section=?"
         args.append(section)
-    with _conn() as conn:
+    with _db() as conn:
         rows = conn.execute(q, args).fetchall()
     out = {"course_id": course_id, "sections": {}}
     for r in rows:
@@ -491,5 +528,5 @@ def get_change_history(
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY changed_at, hist_id"
-    with _conn() as c:
+    with _db() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
