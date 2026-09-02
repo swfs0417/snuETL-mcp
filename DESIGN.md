@@ -47,7 +47,8 @@ snuETL-mcp/
 | `get_upcoming` | 마감임박 To-Do | ✅ |
 | `list_announcements(course_id)` | 공지 | ✅ |
 | `get_grades(active_only)` | 성적 요약 | ✅ |
-| `list_files(course_id)` | 파일 목록 | ✅ |
+| `list_files(course_id)` | 파일 목록(파일 탭) | ✅ |
+| `list_linked_files(course_id)` | 본문에 링크로만 걸린 파일 + 외부 링크 | ✅ |
 | `get_syllabus(course_id)` | 강의계획서 | ➕ 추가 |
 | `list_modules(course_id)` | 주차별 구조 | ➕ 추가 |
 | `list_lecture_videos(course_id)` | 영상 강의 목록(+유튜브 출처 해석) | ✅ |
@@ -118,3 +119,19 @@ snuETL-mcp/
 - **Phase 4:** 쓰기 도구(제출 등) `ETL_ENABLE_WRITE` 게이트.
 - **Phase 5:** SQLite 캐시 + 스케줄 자동 동기화.
 - **Phase 6:** LearningX 고유(진도율/PIN 출석) 역분석.
+
+## 7. 본문 링크 자료 수집 (links.py)
+
+Canvas 는 페이지·공지 본문에 삽입된 파일을 `hidden=true` 로 두기 때문에
+`GET /courses/:id/files` 목록에 나오지 않는다. 반면 `GET /files/:file_id` 직접
+조회·다운로드는 학생 토큰으로도 200 이다(2026-09-02 확인, 그리스·로마신화 강의).
+그래서 `links.py` 는 다음을 훑어 파일 id 를 모은다:
+
+- syllabus_body / pages / assignments / quizzes / announcements+discussions 본문
+- 토론 글 첨부(attachments), 모듈 항목(File=content_id, ExternalUrl=external_url)
+
+각 참조는 `<a>` = `link`(첨부 링크), `<img>`·`<iframe>` = `embed`(본문 삽입)로
+구분해 기본 다운로드 대상은 `link` 만으로 제한한다. 다른 강의에서 복사해온 본문의
+파일 id 는 조회가 404 이므로 `error` 를 남기고 대상에서 제외한다.
+외부 링크는 `direct_file|google_drive|youtube|lcms|other` 로 분류해, 직접 파일
+링크만 옵션(`include_external_links`)으로 내려받는다.

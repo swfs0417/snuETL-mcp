@@ -10,6 +10,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 import canvas_client as cc
+import links
 import materials
 import openboard
 import schedule
@@ -104,6 +105,24 @@ def get_grades(active_only: bool = True) -> list[dict]:
 def list_files(course_id: int) -> list[dict]:
     """특정 강의(course_id)의 강의자료 파일 목록과 다운로드 URL을 반환한다."""
     return cc.list_files(course_id)
+
+
+@mcp.tool()
+def list_linked_files(course_id: int, force: bool = False) -> dict:
+    """강의 '파일' 목록에 안 뜨고 본문에 링크로만 걸린 자료를 찾아 반환한다.
+
+    교수가 페이지·공지·과제 본문에 파일을 링크로만 걸면 Canvas 가 그 파일을 hidden 으로
+    두어 list_files(파일 탭)에는 안 나온다. 이 도구는 강의계획서·페이지·과제·퀴즈·공지·
+    토론 본문과 모듈 항목을 모두 훑어서
+
+      - files: 발견된 eTL 파일(이름·크기·확장자, in_files_list=False 면 파일 탭에 없는 것,
+        ref='link' 는 첨부 링크·'embed' 는 본문 삽입 이미지, sources 는 발견 위치)
+      - external_links: 외부 링크(kind=direct_file|google_drive|youtube|lcms|other)
+
+    를 돌려준다. 실제 저장은 download_course_files(include_linked=True, 기본값)가 한다.
+    결과는 120초간 캐시된다 — 방금 올라온 자료를 확인하려면 force=True.
+    """
+    return links.scan_course_links(course_id, force=force)
 
 
 @mcp.tool()
@@ -230,6 +249,9 @@ def download_course_files(
     max_size_mb: float | None = None,
     only_file_ids: list[int] | None = None,
     exclude_file_ids: list[int] | None = None,
+    include_linked: bool = True,
+    include_embedded_images: bool = False,
+    include_external_links: bool = False,
 ) -> dict:
     """강의 자료를 의예과 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
 
@@ -244,6 +266,13 @@ def download_course_files(
       - only_file_ids: 이 파일 id 만 받음(콕 집어 선택; 다른 필터 무시).
       - exclude_file_ids: 이 파일 id 제외.
 
+    파일 탭에 안 뜨고 본문에 링크로만 걸린 자료도 기본으로 함께 받는다:
+      - include_linked(기본 True): 페이지·공지·과제·모듈 본문의 eTL 파일 링크까지 수집
+        (각 파일의 출처는 결과의 via 에 'page: 평가 안내' 식으로 표시).
+      - include_embedded_images: 본문에 삽입된 이미지(<img>)까지 받음(기본 제외).
+      - include_external_links: 외부 사이트의 직접 파일 링크(pdf 등)도 받음(기본 제외).
+    무엇이 링크로만 걸려 있는지는 list_linked_files 로 미리 확인할 수 있다.
+
     먼저 dry_run=True 로 호출하면 각 파일의 id·크기(MB)·확장자와 현재 필터
     적용 시 선택 여부(selected)를 목록으로 돌려준다 → 사용자에게 보여주고
     고르게 한 뒤, only_file_ids 등으로 실제 다운로드하면 된다.
@@ -252,7 +281,9 @@ def download_course_files(
         course_id, dest_dir=dest_dir, overwrite=overwrite, dry_run=dry_run,
         skip_video=skip_video, include_ext=include_ext, exclude_ext=exclude_ext,
         max_size_mb=max_size_mb, only_file_ids=only_file_ids,
-        exclude_file_ids=exclude_file_ids,
+        exclude_file_ids=exclude_file_ids, include_linked=include_linked,
+        include_embedded_images=include_embedded_images,
+        include_external_links=include_external_links,
     )
 
 

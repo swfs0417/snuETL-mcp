@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import canvas_client as cc
+import links
 
 # 다운로드 기본 경로 fallback. 실제 경로는 .env 의 ETL_DOWNLOAD_DIR 로 지정한다.
 SNU_BASE = os.path.expanduser(os.environ.get("ETL_DOWNLOAD_DIR", "") or "./downloads")
@@ -172,8 +173,8 @@ def _passes_filter(
     return True
 
 
-def _file_info(f, target: Path, root: Path, selected: bool) -> dict:
-    """미리보기/리포트용 파일 메타데이터."""
+def _file_info(f, target: Path, root: Path, selected: bool, via: Optional[dict] = None) -> dict:
+    """미리보기/리포트용 파일 메타데이터. via 는 본문 링크로 찾은 경우의 출처."""
     size = getattr(f, "size", None)
     try:
         rel = str(target.relative_to(root))
@@ -186,13 +187,22 @@ def _file_info(f, target: Path, root: Path, selected: bool) -> dict:
         "ext": _ext(target.name),
         "size_mb": round(size / 1024 / 1024, 1) if size else None,
         "selected": selected,
+        "via": f"{via.get('type')}: {via.get('title')}" if via else None,
     }
 
 
-def _course_targets(course_id: int, base: Optional[str]):
-    """(course, course_name, root, how, [(file, target_path), ...]) 를 계산한다.
+def _course_targets(
+    course_id: int,
+    base: Optional[str],
+    include_linked: bool = True,
+    include_embedded_images: bool = False,
+):
+    """(course, course_name, root, how, [(file, target_path, via), ...]) 를 계산한다.
 
     다운로드와 정리(organize)가 동일한 대상 경로 계산을 공유하도록 분리.
+    include_linked=True 면 파일 목록(Files)에 안 뜨고 페이지·공지·과제 본문에 링크로만
+    걸린 파일까지 합친다(via 에 출처를 담는다). 이런 파일은 Canvas 폴더 정보가 없으므로
+    과목 폴더 최상위에 저장한다.
     """
     canvas = cc.get_canvas()
     course = canvas.get_course(course_id)
@@ -215,27 +225,24 @@ def _course_targets(course_id: int, base: Optional[str]):
         full = folder_map.get(getattr(f, "folder_id", None), "")
         rel = re.sub(r"^course files/?", "", full)
         target = (root / rel / disp) if rel else (root / disp)
-        targets.append((f, target))
+        targets.append((f, target, None))
 
-    # 과제 첨부파일(파일 보관함에 없는 것)도 포함 — 과제 설명의 /files/<id> 링크
-    try:
-        for a in course.get_assignments():
-            desc = getattr(a, "description", "") or ""
-            for fid in dict.fromkeys(re.findall(r"/files/(\d+)", desc)):
-                fid = int(fid)
-                if fid in seen_ids:
+    # 파일 목록에 안 뜨고 본문(페이지·공지·과제·모듈)에 링크로만 걸린 파일도 포함
+    if include_linked:
+        try:
+            for f, via in links.linked_file_objects(
+                course, include_embedded=include_embedded_images
+            ):
+                if f.id in seen_ids:
                     continue
-                seen_ids.add(fid)
-                try:
-                    f = course.get_file(fid)
-                except Exception:
-                    continue
+                seen_ids.add(f.id)
                 disp = _safe(
-                    getattr(f, "display_name", None) or getattr(f, "filename", f"file_{fid}")
+                    getattr(f, "display_name", None)
+                    or getattr(f, "filename", f"file_{f.id}")
                 )
-                targets.append((f, root / disp))
-    except Exception:
-        pass
+                targets.append((f, root / disp, via))
+        except Exception:
+            pass  # 링크 스캔 실패해도 파일 목록 다운로드는 진행
 
     return course, course_name, root, how, targets
 
@@ -251,6 +258,9 @@ def download_course_files(
     max_size_mb: Optional[float] = None,
     only_file_ids: Optional[list[int]] = None,
     exclude_file_ids: Optional[list[int]] = None,
+    include_linked: bool = True,
+    include_embedded_images: bool = False,
+    include_external_links: bool = False,
 ) -> dict:
     """강의 자료를 의예과 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
 
@@ -266,10 +276,20 @@ def download_course_files(
       - exclude_file_ids: 이 파일 id 는 제외.
     파일 id·크기는 dry_run=True 나 list_files 로 미리 확인할 수 있다.
 
+    본문 링크로만 걸린 자료(파일 목록에 안 뜨는 것):
+      - include_linked(기본 True): 페이지·공지·과제·모듈 본문에 링크로 걸린 eTL 파일을
+        함께 받는다. 각 파일의 출처는 via 로 표시된다.
+      - include_embedded_images: 본문에 삽입된 이미지(<img>)까지 받는다(기본 제외).
+      - include_external_links: 외부 사이트의 직접 파일 링크(pdf 등)도 받는다(기본 제외).
+        구글드라이브·유튜브 같은 페이지형 링크는 대상이 아니며 목록으로만 보고한다.
+
     dry_run=True 면 다운로드 없이 결정된 경로와 파일 목록(필터 적용 결과 selected
     표시)을 반환하므로, 무엇을 받을지 사용자에게 보여주고 고르게 할 수 있다.
     """
-    course, course_name, root, how, targets = _course_targets(course_id, dest_dir)
+    course, course_name, root, how, targets = _course_targets(
+        course_id, dest_dir, include_linked=include_linked,
+        include_embedded_images=include_embedded_images,
+    )
 
     inc = _norm_exts(include_ext)
     exc = _norm_exts(exclude_ext)
@@ -277,24 +297,30 @@ def download_course_files(
     excl_ids = set(exclude_file_ids) if exclude_file_ids else None
 
     selected, excluded = [], []
-    for f, target in targets:
+    for f, target, via in targets:
         ok = _passes_filter(
             f, target, include_ext=inc, exclude_ext=exc, max_size_mb=max_size_mb,
             skip_video=skip_video, only_ids=only_ids, exclude_ids=excl_ids,
         )
-        (selected if ok else excluded).append((f, target))
+        (selected if ok else excluded).append((f, target, via))
+
+    ext_links = _external_file_links(course_id) if include_external_links else []
 
     if dry_run:
-        files = [_file_info(f, t, root, True) for f, t in selected]
-        files += [_file_info(f, t, root, False) for f, t in excluded]
-        return {
+        files = [_file_info(f, t, root, True, v) for f, t, v in selected]
+        files += [_file_info(f, t, root, False, v) for f, t, v in excluded]
+        out = {
             "course": course_name, "resolved_dir": str(root), "match": how,
             "selected": len(selected), "excluded": len(excluded),
+            "linked_only": sum(1 for f, t, v in selected if v),
             "files": files,
         }
+        if include_external_links:
+            out["external_files"] = ext_links
+        return out
 
     downloaded, skipped, errors = [], [], []
-    for f, target in selected:
+    for f, target, via in selected:
         target.parent.mkdir(parents=True, exist_ok=True)
         size = getattr(f, "size", None)
         if target.exists() and not overwrite and (
@@ -308,11 +334,38 @@ def download_course_files(
         except Exception as e:
             errors.append({"file": target.name, "error": str(e)})
 
-    return {
+    result = {
         "course": course_name, "resolved_dir": str(root), "match": how,
         "downloaded": len(downloaded), "skipped": len(skipped),
+        "linked_only": sum(1 for f, t, v in selected if v),
         "excluded_by_filter": len(excluded), "errors": errors,
     }
+    if include_external_links:
+        ext_results = []
+        for e in ext_links:
+            try:
+                ext_results.append({**links.download_external_file(
+                    e["url"], str(root), overwrite=overwrite), "via": e["via"]})
+            except Exception as exc:
+                ext_results.append({"url": e["url"], "status": "error", "error": str(exc)})
+        result["external_files"] = ext_results
+    return result
+
+
+def _external_file_links(course_id: int) -> list[dict]:
+    """외부 사이트에 걸린 '직접 파일 링크'(pdf 등)만 추린다."""
+    try:
+        scan = links.scan_course_links(course_id, resolve=False)
+    except Exception:
+        return []
+    out = []
+    for e in scan["external_links"]:
+        if e["kind"] != "direct_file":
+            continue
+        src = (e["sources"] or [{}])[0]
+        out.append({"url": e["url"], "text": e.get("text"),
+                    "via": f"{src.get('type')}: {src.get('title')}"})
+    return out
 
 
 # --- 정리 (Organize) — snuETL-mcp 이 받은 파일만 분류 이동 -----------------------
@@ -346,7 +399,7 @@ def organize_course_files(
     cats = {"강의록", "과제물"}
 
     planned, moved, skipped, missing = [], [], [], []
-    for f, target in targets:
+    for f, target, _via in targets:
         if not target.exists():
             missing.append(str(target))
             continue
