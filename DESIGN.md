@@ -161,7 +161,22 @@ Canvas 는 페이지·공지 본문에 삽입된 파일을 `hidden=true` 로 두
 
 권한이 없는 것(확인됨): analytics/student_summaries, gradebook_history, rubrics(401).
 
-## 9. 다음 단계 — 쓰기(상호작용)
+## 9. 쓰기(상호작용) — `write.py`, 2026-09-02
 
-`ETL_ENABLE_WRITE=1` 게이트로 분리해서 추가할 범위(사용자 확정):
-과제 제출, 게시판·토론 글/댓글 작성, 출결·영상 진도. (쪽지 발송은 범위 밖)
+`ETL_ENABLE_WRITE=1` 일 때만 도구를 등록하고(실수 방지 1단계), 각 도구는
+`confirm=True` 없이는 미리보기만 돌려준다(2단계).
+
+- **과제 제출**: canvasapi `upload_to_submission` → `submit`. 과제의 `submission_types`
+  와 요청 형식이 다르면 미리 막는다. 되돌릴 수 없음.
+- **토론**: `post_entry` / `post_reply` / `create_discussion_topic`.
+- **게시판(LearningX)**: 웹 UI 와 같은 multipart POST — 글은
+  `POST /learningx_board/courses/{cid}/boards/{bid}/posts` 에
+  `title·content·is_notice·is_secret`(+`attachment_files[]`), 댓글은
+  `.../posts/{pid}/comments` 에 `content`(+`parent_comment_id`).
+  수정·삭제는 PUT/DELETE 가 아니라 **POST + `_method`** 다(프런트 번들에서 확인).
+  인증은 읽기와 같은 `Authorization: Bearer {xn_api_token}`.
+  '열린게시판'(OpenBoard) 쓰기는 미지원 — '게시판'만.
+- **출결·영상 시청 기록 쓰기는 만들지 않았다.** 시청하지 않은 강의를 시청 처리하는
+  용도가 되어 출결 기록 위조에 해당한다. 진도 확인은 읽기(`get_attendance`)로 한다.
+- 미검증: 실제 POST 경로는 실제 글이 올라가는 부작용 때문에 아직 라이브 검증을 안 했다
+  (미리보기·게이트·형식 검증까지만 확인). 첫 실행은 지울 수 있는 게시판에서 할 것.

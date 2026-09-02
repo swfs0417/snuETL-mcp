@@ -17,6 +17,7 @@ SNU eTL(Canvas LMS)을 MCP 도구로 노출하는 Python MCP 서버. 강의·과
 | `boards.py` | 게시판·열린게시판(LTI 두 종류) 글/첨부/댓글 |
 | `weekly.py` | 주차학습 항목과 내 진도·출결 상태 |
 | `snapshot.py` | 강의 탭 전체를 훑는 화면 스냅샷 + 커버리지 |
+| `write.py` | 쓰기 — 과제 제출·토론 답글·게시판 글/댓글 (기본 비활성) |
 | `video.py` | 영상 강의(LearningX→LCMS→유튜브) 대본 추출 |
 | `sync_job.py` | 자동 동기화 잡 (cron 실행, 결과를 `store/sync.log`에 누적) |
 | `DESIGN.md` | 설계 문서 |
@@ -98,6 +99,21 @@ include_external_links=True    # 외부 사이트 직접 파일 링크(pdf 등)�
 `sync_snapshot` 은 이 스냅샷을 SQLite 에 저장하고, 다음 동기화 때 달라진 항목을
 `change_history` 에 남긴다(예: `성적 / 추가 2 → "Homework 3; Homework 4"`).
 `sync_all` 은 기본으로 이번 학기 과목의 스냅샷까지 갱신한다(`snapshot=False` 로 생략).
+
+## 쓰기(상호작용)
+
+기본은 **꺼져 있다**. `.env` 에 `ETL_ENABLE_WRITE=1` 을 넣고 서버를 다시 시작해야
+쓰기 도구가 등록된다. 그 위에 한 겹 더: 모든 쓰기 도구는 `confirm=True` 가 없으면
+**무엇이 어디에 올라가는지 미리보기만** 돌려준다.
+
+| 도구 | 되돌리기 |
+|---|---|
+| `submit_assignment`(파일/텍스트/URL) | **불가** — 재제출은 새 시도로 쌓임 |
+| `reply_discussion`, `create_discussion` | eTL 설정에 따라 다름 |
+| `create_board_post` / `create_board_comment` | `delete_board_post` / `delete_board_comment` |
+
+출결·영상 시청 기록 쓰기는 넣지 않았다(시청하지 않은 강의를 시청 처리하는 용도가 되어
+출결 기록 위조가 된다). 진도 확인은 읽기 쪽 `get_attendance`·`list_weekly_items` 로 한다.
 
 ## 자동 실행
 

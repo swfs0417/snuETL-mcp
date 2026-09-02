@@ -18,6 +18,7 @@ import snapshot as snap
 import store
 import video
 import weekly
+import write
 
 mcp = FastMCP("snu-etl")
 
@@ -528,6 +529,116 @@ def extract_events_from_announcements(course_id: int | None = None) -> list[dict
     먼저 sync_announcements(또는 sync_all)로 저장소를 채워두어야 한다.
     """
     return schedule.extract_events_from_announcements(course_id=course_id)
+
+
+# --- 쓰기 (Write) — .env 의 ETL_ENABLE_WRITE=1 일 때만 등록 ---------------------
+#
+# 실수 방지를 위해 두 겹으로 막는다: (1) 이 게이트가 없으면 도구가 아예 안 보이고,
+# (2) 각 도구는 confirm=True 없이는 미리보기만 돌려준다.
+
+if write.write_enabled():
+
+    @mcp.tool()
+    def submit_assignment(
+        course_id: int,
+        assignment_id: int,
+        text: str | None = None,
+        url: str | None = None,
+        file_paths: list[str] | None = None,
+        confirm: bool = False,
+    ) -> dict:
+        """과제를 제출한다(파일/텍스트/URL 중 과제가 허용하는 형식으로).
+
+        **되돌릴 수 없다.** confirm=False(기본)면 무엇이 어느 과제에 제출될지 미리보기만
+        돌려주니, 사용자에게 보여주고 승인받은 뒤 confirm=True 로 다시 호출해야 한다.
+        file_paths 는 로컬 절대경로 목록.
+        """
+        return write.submit_assignment(
+            course_id, assignment_id, text=text, url=url,
+            file_paths=file_paths, confirm=confirm,
+        )
+
+    @mcp.tool()
+    def reply_discussion(
+        course_id: int, topic_id: int, message: str,
+        parent_entry_id: int | None = None, confirm: bool = False,
+    ) -> dict:
+        """토론 글(topic_id)에 답글을 단다. parent_entry_id 를 주면 대댓글이 된다.
+
+        confirm=False 면 미리보기만 돌려준다(다른 사람에게 보이는 글이므로 승인 필요).
+        """
+        return write.reply_discussion(
+            course_id, topic_id, message,
+            parent_entry_id=parent_entry_id, confirm=confirm,
+        )
+
+    @mcp.tool()
+    def create_discussion(
+        course_id: int, title: str, message: str, confirm: bool = False
+    ) -> dict:
+        """토론 게시판에 새 글을 만든다(학생 작성이 허용된 강의에서만).
+
+        confirm=False 면 미리보기만 돌려준다.
+        """
+        return write.create_discussion(course_id, title, message, confirm=confirm)
+
+    @mcp.tool()
+    def create_board_post(
+        course_id: int,
+        board_id: str,
+        title: str,
+        content: str,
+        file_paths: list[str] | None = None,
+        is_secret: bool = False,
+        nickname: str | None = None,
+        confirm: bool = False,
+    ) -> dict:
+        """'게시판'(LearningX)에 글을 올린다 — 과제 제출용 게시판·Q&A 등.
+
+        board_id 는 list_boards 가 돌려준 값. content 는 HTML 가능, file_paths 는 첨부할
+        로컬 파일 경로. is_secret=True 면 비밀글(허용된 게시판만).
+        confirm=False 면 미리보기만 돌려준다. 올린 글은 delete_board_post 로 지울 수 있다.
+        """
+        return write.create_board_post(
+            course_id, board_id, title, content, file_paths=file_paths,
+            is_secret=is_secret, nickname=nickname, confirm=confirm,
+        )
+
+    @mcp.tool()
+    def create_board_comment(
+        course_id: int,
+        board_id: str,
+        post_id: str,
+        content: str,
+        parent_comment_id: str | None = None,
+        file_paths: list[str] | None = None,
+        confirm: bool = False,
+    ) -> dict:
+        """게시판 글에 댓글을 단다(감상문 제출 등). parent_comment_id 를 주면 대댓글.
+
+        confirm=False 면 미리보기만 돌려준다.
+        """
+        return write.create_board_comment(
+            course_id, board_id, post_id, content,
+            parent_comment_id=parent_comment_id, file_paths=file_paths, confirm=confirm,
+        )
+
+    @mcp.tool()
+    def delete_board_post(
+        course_id: int, board_id: str, post_id: str, confirm: bool = False
+    ) -> dict:
+        """게시판 글을 삭제한다(본인 글). confirm=False 면 미리보기만."""
+        return write.delete_board_post(course_id, board_id, post_id, confirm=confirm)
+
+    @mcp.tool()
+    def delete_board_comment(
+        course_id: int, board_id: str, post_id: str, comment_id: str,
+        confirm: bool = False,
+    ) -> dict:
+        """게시판 댓글을 삭제한다(본인 댓글). confirm=False 면 미리보기만."""
+        return write.delete_board_comment(
+            course_id, board_id, post_id, comment_id, confirm=confirm
+        )
 
 
 if __name__ == "__main__":
