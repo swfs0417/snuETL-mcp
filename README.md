@@ -1,7 +1,7 @@
 # snuETL-mcp
 
 SNU eTL(Canvas LMS)을 MCP 도구로 노출하는 Python MCP 서버. 강의·과제·공지·성적을
-조회하고, 마감일/공지를 로컬에 **누적 저장**하며, 강의 자료를 의예과 폴더 구조에 맞춰
+조회하고, 마감일/공지를 로컬에 **누적 저장**하며, 강의 자료를 학교/학기/과목 폴더 구조에 맞춰
 다운로드·정리한다.
 
 ## 구성
@@ -11,7 +11,7 @@ SNU eTL(Canvas LMS)을 MCP 도구로 노출하는 Python MCP 서버. 강의·과
 | `server.py` | FastMCP 진입점 — 도구 등록 |
 | `canvas_client.py` | Canvas 인증 + raw 조회 → dict 변환 |
 | `store.py` | SQLite 누적 저장소 (courses/announcements/assignments + change_history) |
-| `materials.py` | 강의 자료 다운로드(폴더 구조 매핑) + 강의록/과제물 정리 |
+| `materials.py` | 강의 자료 다운로드(폴더 구조 매핑) + 과목 폴더 정리 |
 | `links.py` | 본문(페이지·공지·과제) 속 링크 자료 스캔 — 파일 탭에 안 뜨는 파일 |
 | `lti.py` | LearningX LTI 공통 진입점 (도구 id 탐색·런치·API) |
 | `boards.py` | 게시판·열린게시판(LTI 두 종류) 글/첨부/댓글 |
@@ -29,7 +29,7 @@ SNU eTL(Canvas LMS)을 MCP 도구로 노출하는 Python MCP 서버. 강의·과
 ```
 ETL_BASE_URL=https://myetl.snu.ac.kr
 ETL_TOKEN=<개인 액세스 토큰>
-ETL_DOWNLOAD_DIR=/Users/.../의예과   # 강의 자료 저장 기본 경로
+ETL_DOWNLOAD_DIR=/Users/.../학교   # 강의 자료 저장 기본 경로
 ```
 
 ```bash
@@ -122,3 +122,16 @@ include_external_links=True    # 외부 사이트 직접 파일 링크(pdf 등)�
 ```
 0 * * * * /abs/.venv/bin/python /abs/sync_job.py >> /abs/store/cron.out 2>&1 # snuETL-mcp-sync
 ```
+
+## 자료 저장 규칙
+
+`ETL_DOWNLOAD_DIR`를 학교 폴더로 지정하면 `2026-2/실험언어학/파일명` 형태로
+저장합니다. 여름과 겨울학기는 각각 `2026-S`, `2026-W`입니다.
+강의록·과제물 하위 폴더는 자동으로 만들지 않습니다.
+같은 과목이 다른 학기에 있어도 해당 학기 폴더에 저장합니다.
+
+`course_names.json`에 eTL 과목명과 한글 이름을 추가하세요.
+학기 접두사와 분반 번호는 자동 제거하며, 매핑하지 않은 이름은 그대로 사용합니다.
+현재 `Experimental Linguistics`는 `실험언어학`으로 설정되어 있습니다.
+JSON은 호출할 때 읽으므로 이름 변경 후 서버를 다시 시작할 필요가 없습니다.
+이 설정은 일정과 캘린더의 과목명에도 적용됩니다.

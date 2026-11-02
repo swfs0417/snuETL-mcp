@@ -1,15 +1,8 @@
-"""강의 파일(강의록) 다운로드 — 서울대 의예과 폴더 구조에 맞춰 저장.
-
-저장 위치:  <base>/<학기 폴더>/<과목명>/  (Canvas 내부 폴더 구조 보존)
-  - base 기본값: ETL_DOWNLOAD_DIR 또는 SNU_BASE.
-  - 과목명: eTL 강의명에서 앞 학기코드(2026-1)와 뒤 분반((064))을 제거.
-  - 학기 폴더: 이미 존재하는 폴더가 있으면 그대로 재사용, 없으면 eTL 학기코드를
-    사용자 폴더 규칙(시간순 번호)으로 변환해 생성.
-이미 받은 파일(같은 크기)은 건너뛰어 증분 다운로드한다.
-"""
+"""강의 자료를 <학교>/<학기>/<한글 과목명>/에 저장한다."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import unicodedata
@@ -22,27 +15,14 @@ import links
 # 다운로드 기본 경로 fallback. 실제 경로는 .env 의 ETL_DOWNLOAD_DIR 로 지정한다.
 SNU_BASE = os.path.expanduser(os.environ.get("ETL_DOWNLOAD_DIR", "") or "./downloads")
 
-# eTL 학기코드 -> (사용자 폴더 번호, 라벨). eTL: 1=1학기,2=2학기,3=여름,4=겨울.
-# 사용자 폴더는 시간순 번호: 1학기=1, 여름=2, 2학기=3, 겨울=4.
-_TERM_MAP = {
-    1: (1, "1학기"),
-    2: (3, "2학기"),
-    3: (2, "여름계절학기"),
-    4: (4, "겨울계절학기"),
-}
-
-# eTL 강의명(접두/분반 제거 후) -> 표시용 과목명 별칭(폴더·일정·캘린더 공용).
-# eTL 이 영어이거나 원하는 이름과 다를 때 여기에 추가하면 다운로드 폴더명과
-# 캘린더 이벤트 과목명에 동일하게 적용된다. 키는 공백 무시·NFC 로 비교한다.
-_NAME_ALIASES = {
-    "Basics of Deep Learning": "딥러닝의 기초",
-    "Introduction to Machine Learning": "기계학습 개론",
-    "Advanced English: Exploring Film": "고급영어 영화",
-}
+# eTL: 1=1학기, 2=2학기, 3=여름, 4=겨울.
+_TERM_MAP = {1: "1", 2: "2", 3: "S", 4: "W"}
+_ALIASES_PATH = Path(__file__).with_name("course_names.json")
 
 
 def _safe(name: Optional[str]) -> str:
-    return re.sub(r'[/\\:*?"<>|]', "_", (name or "untitled")).strip() or "untitled"
+    safe = re.sub(r'[/\\:*?"<>|]', "_", (name or "untitled")).strip()
+    return "untitled" if safe in {"", ".", ".."} else safe
 
 
 def _norm(s: Optional[str]) -> str:
@@ -61,14 +41,15 @@ def clean_course_name(name: Optional[str]) -> str:
 
 
 def display_course_name(name: Optional[str]) -> str:
-    """표시용 과목명을 일관되게 만든다(폴더·일정·캘린더 공용 단일 진입점).
-
-    학기코드·분반을 떼고(clean_course_name), 영어명 등은 _NAME_ALIASES 로
-    한국어(또는 사전 설정명)로 치환한다. 새 과목명을 통일하려면 _NAME_ALIASES 에
-    한 줄 추가하면 다운로드 폴더와 캘린더 양쪽에 동시에 반영된다.
-    """
+    """course_names.json의 이름을 폴더·일정·캘린더에 공통 적용한다."""
+    aliases = json.loads(_ALIASES_PATH.read_text(encoding="utf-8"))
+    if not isinstance(aliases, dict) or any(
+        not isinstance(k, str) or not isinstance(v, str) or not v.strip()
+        for k, v in aliases.items()
+    ):
+        raise ValueError("course_names.json은 과목명: 한글 이름 형식의 객체여야 합니다.")
     clean = clean_course_name(name)
-    return {_norm(k): v for k, v in _NAME_ALIASES.items()}.get(_norm(clean), clean)
+    return {_norm(k): v for k, v in aliases.items()}.get(_norm(clean), clean)
 
 
 def _term_folder(course_name: str) -> Optional[str]:
@@ -77,14 +58,13 @@ def _term_folder(course_name: str) -> Optional[str]:
     if not m:
         return None
     year, code = m.group(1), int(m.group(2))
-    num, label = _TERM_MAP.get(code, (code, f"{code}학기"))
-    return f"{year}-{num} {label}"
+    return f"{year}-{_TERM_MAP.get(code, str(code))}"
 
 
 def resolve_course_dir(course_name: str, base: str) -> tuple[Path, str]:
     """과목의 저장 폴더를 결정한다. (경로, 'existing'|'computed') 반환.
 
-    base 아래에 같은 과목명 폴더가 이미 있으면 그것을 재사용한다.
+    해당 학기 안에서 같은 과목명 폴더를 재사용한다.
     """
     base_p = Path(base).expanduser()
     clean = display_course_name(course_name)  # 학기코드·분반 제거 + 별칭 치환(공용)
@@ -94,7 +74,7 @@ def resolve_course_dir(course_name: str, base: str) -> tuple[Path, str]:
     matches = []
     if base_p.exists():
         for term in base_p.iterdir():
-            if not term.is_dir():
+            if not term.is_dir() or (tf and term.name != tf):
                 continue
             for cdir in term.iterdir():
                 if cdir.is_dir() and _norm(cdir.name) == target:
@@ -196,6 +176,7 @@ def _course_targets(
     base: Optional[str],
     include_linked: bool = True,
     include_embedded_images: bool = False,
+    preserve_folders: bool = False,
 ):
     """(course, course_name, root, how, [(file, target_path, via), ...]) 를 계산한다.
 
@@ -223,7 +204,9 @@ def _course_targets(
         seen_ids.add(f.id)
         disp = _safe(getattr(f, "display_name", None) or getattr(f, "filename", f"file_{f.id}"))
         full = folder_map.get(getattr(f, "folder_id", None), "")
-        rel = re.sub(r"^course files/?", "", full)
+        rel = re.sub(r"^course files/?", "", full) if preserve_folders else ""
+        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+            raise ValueError(f"잘못된 Canvas 폴더 경로: {full}")
         target = (root / rel / disp) if rel else (root / disp)
         targets.append((f, target, None))
 
@@ -244,6 +227,12 @@ def _course_targets(
         except Exception:
             pass  # 링크 스캔 실패해도 파일 목록 다운로드는 진행
 
+    paths = set()
+    for _, target, _ in targets:
+        key = unicodedata.normalize("NFC", str(target)).casefold()
+        if key in paths:
+            raise ValueError(f"같은 저장 경로의 파일이 여러 개입니다: {target}")
+        paths.add(key)
     return course, course_name, root, how, targets
 
 
@@ -262,7 +251,7 @@ def download_course_files(
     include_embedded_images: bool = False,
     include_external_links: bool = False,
 ) -> dict:
-    """강의 자료를 의예과 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
+    """강의 자료를 학교 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
 
     dest_dir 로 base 를 바꿀 수 있다(생략 시 ETL_DOWNLOAD_DIR 또는 SNU_BASE).
     같은 크기 파일이 이미 있으면 건너뛴다(증분).
@@ -370,32 +359,22 @@ def _external_file_links(course_id: int) -> list[dict]:
 
 # --- 정리 (Organize) — snuETL-mcp 이 받은 파일만 분류 이동 -----------------------
 
-# 과제물로 분류할 파일명 패턴 (그 외는 강의록)
-_ASSIGN_PAT = re.compile(
-    r"(hw[\s_-]?\d*|homework|assign|과제|숙제|problem[\s_-]?set|pset|template|제출|submit)",
-    re.I,
-)
-
-
-def classify_lecture_or_assignment(name: str) -> str:
-    """파일명을 '강의록' 또는 '과제물' 로 분류한다(규칙 기반)."""
-    return "과제물" if _ASSIGN_PAT.search(name or "") else "강의록"
-
-
 def organize_course_files(
     course_id: int,
     dest_dir: Optional[str] = None,
     mapping: Optional[dict] = None,
     dry_run: bool = False,
 ) -> dict:
-    """snuETL-mcp 이 받은 강의 파일만 '강의록'/'과제물' 하위 폴더로 분류 이동한다.
+    """Canvas 파일을 과목 폴더 바로 아래로 정리한다.
 
     Canvas 파일 목록으로 대상 경로를 재계산하므로 사용자의 다른 작업물(코드·venv 등)은
-    절대 건드리지 않는다. mapping={파일명: 카테고리} 로 LLM 판단 결과를 덮어쓸 수 있다.
-    dry_run=True 면 이동 계획만 반환한다. 이미 분류 폴더 안에 있는 파일은 건너뛴다.
+    건드리지 않는다. mapping={파일명: 카테고리} 를 주면 해당 파일만 하위 폴더로 옮긴다.
+    dry_run=True 면 이동 계획만 반환한다. 이미 목적지에 있는 파일은 건너뛴다.
     """
     mapping = mapping or {}
-    _, course_name, root, _, targets = _course_targets(course_id, dest_dir)
+    _, course_name, root, _, targets = _course_targets(
+        course_id, dest_dir, preserve_folders=True
+    )
     cats = {"강의록", "과제물"}
 
     planned, moved, skipped, missing = [], [], [], []
@@ -403,14 +382,13 @@ def organize_course_files(
         if not target.exists():
             missing.append(str(target))
             continue
-        # 이미 분류 폴더(강의록/과제물) 안이면 건너뜀
-        if any(p.name in cats for p in target.parents):
+        category = mapping.get(target.name, "")
+        if category not in cats | {""}:
+            raise ValueError("mapping 값은 '강의록', '과제물', 빈 문자열만 가능합니다.")
+        dest = root / category / target.name
+        if dest.resolve() == target.resolve():
             skipped.append(str(target))
             continue
-        category = mapping.get(target.name) or classify_lecture_or_assignment(target.name)
-        if category not in cats:
-            category = "강의록"
-        dest = root / category / target.name
         # 충돌 시 숫자 접미사
         if dest.exists() and dest.resolve() != target.resolve():
             i = 2

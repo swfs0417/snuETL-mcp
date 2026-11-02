@@ -368,9 +368,9 @@ def download_course_files(
     include_embedded_images: bool = False,
     include_external_links: bool = False,
 ) -> dict:
-    """강의 자료를 의예과 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
+    """강의 자료를 학교 폴더 구조(<base>/<학기>/<과목명>/)에 맞춰 다운로드한다.
 
-    dest_dir 로 base 를 바꿀 수 있다(생략 시 ETL_DOWNLOAD_DIR 또는 의예과 기본 경로).
+    dest_dir 로 base 를 바꿀 수 있다(생략 시 ETL_DOWNLOAD_DIR 또는 기본 다운로드 경로).
     이미 있는 과목 폴더는 재사용하고, 같은 크기 파일은 건너뛴다(증분).
 
     어떤 파일을 받을지 취사선택하는 필터(영상 등 제외에 사용):
@@ -409,10 +409,10 @@ def organize_course_files(
     mapping: dict | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """snuETL-mcp이 받은 강의 파일을 '강의록'/'과제물' 하위 폴더로 분류 이동한다.
+    """Canvas 파일을 과목 폴더 바로 아래로 정리한다.
 
     Canvas 파일 목록으로 대상만 계산하므로 사용자의 다른 작업물은 건드리지 않는다.
-    규칙 기반 분류가 애매하면 mapping={파일명: '강의록'|'과제물'}로 덮어쓸 수 있다(LLM 판단).
+    mapping={파일명: '강의록'|'과제물'}를 지정하면 해당 파일만 하위 폴더로 옮긴다.
     dry_run=True면 이동 계획만 반환한다.
     """
     return materials.organize_course_files(
